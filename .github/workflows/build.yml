@@ -31,11 +31,23 @@ jobs:
           cp .esphome/build/phicomm-m1/.pioenvs/phicomm-m1/firmware.bin dist/phicomm-m1.bin
           cp .esphome/build/phicomm-m1/.pioenvs/phicomm-m1/firmware.uf2 dist/phicomm-m1.uf2
 
-      # ---------- ② 个人固件：仅当仓库配置了 WIFI secrets 时构建 ----------
+      # ---------- ② 检查仓库是否配置 WIFI secrets ----------
+      # GitHub Actions 不允许在 if: 中直接使用 secrets 上下文，
+      # 因此先把"是否已配置"写入 step output，后续用 output 判断。
+      - name: Check WIFI secrets
+        id: wifi_secrets
+        run: |
+          if [ -n "${{ secrets.WIFI_SSID }}" ] && [ -n "${{ secrets.WIFI_PASSWORD }}" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ---------- ③ 个人固件：仅当仓库配置了 WIFI secrets 时构建 ----------
       # 带个人 WiFi 凭据，只上传 Actions artifact（30 天有效），不发布到 Release，
       # 避免凭据公开。
       - name: Build personal firmware (repo secrets)
-        if: secrets.WIFI_SSID != '' && secrets.WIFI_PASSWORD != ''
+        if: steps.wifi_secrets.outputs.configured == 'true'
         run: |
           rm -rf .esphome/build/phicomm-m1
           echo "wifi_ssid: \"${{ secrets.WIFI_SSID }}\"" > secrets.yaml
@@ -53,13 +65,13 @@ jobs:
           path: dist/
 
       - name: Upload personal firmware artifacts
-        if: secrets.WIFI_SSID != '' && secrets.WIFI_PASSWORD != ''
+        if: steps.wifi_secrets.outputs.configured == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: phicomm-m1-personal-firmware
           path: dist-personal/
 
-      # ---------- ③ 打 tag 时发布默认固件到 GitHub Release ----------
+      # ---------- ④ 打 tag 时发布默认固件到 GitHub Release ----------
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
