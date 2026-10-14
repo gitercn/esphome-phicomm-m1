@@ -16,38 +16,62 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Create secrets.yaml from repo secrets
+      # ---------- ① 默认固件：占位 WiFi，发布到 Release 供公共下载 ----------
+      # 无论仓库是否配置 secrets 都会构建；不含任何个人 WiFi 凭据。
+      - name: Build default firmware (placeholder WiFi)
         run: |
-          if [ -z "${{ secrets.WIFI_SSID }}" ]; then
-            echo "::error::WIFI_SSID secret is not configured."
-            echo "Please add WIFI_SSID and WIFI_PASSWORD to Settings -> Secrets and variables -> Actions."
-            exit 1
-          fi
-          if [ -z "${{ secrets.WIFI_PASSWORD }}" ]; then
-            echo "::error::WIFI_PASSWORD secret is not configured."
-            exit 1
-          fi
-          echo "wifi_ssid: \"${{ secrets.WIFI_SSID }}\"" > secrets.yaml
-          echo "wifi_password: \"${{ secrets.WIFI_PASSWORD }}\"" >> secrets.yaml
-
-      - name: Compile firmware (ESPHome docker)
-        run: |
+          echo 'wifi_ssid: "your_wifi_ssid"' > secrets.yaml
+          echo 'wifi_password: "your_wifi_password"' >> secrets.yaml
           docker run --rm -v "${PWD}":/config -w /config esphome/esphome \
             compile esphome-phicomm-m1.yaml
 
-      - name: Upload firmware artifacts
+      - name: Collect default firmware
+        run: |
+          mkdir -p dist
+          cp .esphome/build/phicomm-m1/.pioenvs/phicomm-m1/firmware.bin dist/phicomm-m1.bin
+          cp .esphome/build/phicomm-m1/.pioenvs/phicomm-m1/firmware.uf2 dist/phicomm-m1.uf2
+
+      # ---------- ② 个人固件：仅当仓库配置了 WIFI secrets 时构建 ----------
+      # 带个人 WiFi 凭据，只上传 Actions artifact（30 天有效），不发布到 Release，
+      # 避免凭据公开。
+      - name: Build personal firmware (repo secrets)
+        if: secrets.WIFI_SSID != '' && secrets.WIFI_PASSWORD != ''
+        run: |
+          rm -rf .esphome/build/phicomm-m1
+          echo "wifi_ssid: \"${{ secrets.WIFI_SSID }}\"" > secrets.yaml
+          echo "wifi_password: \"${{ secrets.WIFI_PASSWORD }}\"" >> secrets.yaml
+          docker run --rm -v "${PWD}":/config -w /config esphome/esphome \
+            compile esphome-phicomm-m1.yaml
+          mkdir -p dist-personal
+          cp .esphome/build/phicomm-m1/.pioenvs/phicomm-m1/firmware.bin dist-personal/phicomm-m1-personal.bin
+          cp .esphome/build/phicomm-m1/.pioenvs/phicomm-m1/firmware.uf2 dist-personal/phicomm-m1-personal.uf2
+
+      - name: Upload default firmware artifacts
         uses: actions/upload-artifact@v4
         with:
           name: phicomm-m1-firmware
-          path: |
-            .esphome/build/phicomm-m1/.pioenvs/phicomm-m1/firmware.bin
-            .esphome/build/phicomm-m1/.pioenvs/phicomm-m1/firmware.uf2
-          if-no-files-found: error
+          path: dist/
 
+      - name: Upload personal firmware artifacts
+        if: secrets.WIFI_SSID != '' && secrets.WIFI_PASSWORD != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: phicomm-m1-personal-firmware
+          path: dist-personal/
+
+      # ---------- ③ 打 tag 时发布默认固件到 GitHub Release ----------
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            .esphome/build/phicomm-m1/.pioenvs/phicomm-m1/firmware.bin
-            .esphome/build/phicomm-m1/.pioenvs/phicomm-m1/firmware.uf2
+          files: dist/*
+          body: |
+            ## 斐讯 M1 ESPHome 固件
+
+            - `phicomm-m1.bin`：串口刷机用（`ltchiptool flash write` 直接写入）
+            - `phicomm-m1.uf2`：与 `.bin` 内容完全相同（LibreTiny UF2 容器），二选一即可
+
+            > ⚠️ 本 Release 是**默认固件**，WiFi 为占位符 `your_wifi_ssid` / `your_wifi_password`，
+            > **刷入后无法联网**。请按 README 自行编译配置个人 WiFi 的固件；
+            > 若仓库配置了 `WIFI_SSID` / `WIFI_PASSWORD` secrets，可在本次
+            > Actions 运行记录的 artifacts 中下载带个人 WiFi 的 `*-personal` 固件。

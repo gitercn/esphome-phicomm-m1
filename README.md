@@ -36,6 +36,74 @@ Home Assistant。
 └── LICENSE                     # GPL-3.0
 ```
 
+## 配置与编译
+
+### 1. 配置 WiFi
+
+复制凭据模板并填写：
+
+```
+cp secrets.yaml.example secrets.yaml
+```
+
+编辑 `secrets.yaml`：
+
+```yaml
+wifi_ssid: "你的WiFi名称"
+wifi_password: "你的WiFi密码"
+```
+
+`secrets.yaml` 已被 `.gitignore` 忽略，不会误提交。
+
+### 2. 编译固件
+
+需要 Python 环境：
+
+```
+pip install esphome
+esphome compile esphome-phicomm-m1.yaml
+```
+
+产物在 `.esphome/build/phicomm-m1/.pioenvs/phicomm-m1/`：
+
+| 文件 | 是什么 | 本机用不用 |
+|---|---|---|
+| `firmware.bin` | **LibreTiny 生成的固件**。注意：它**不是**裸二进制，而是 **UF2 容器格式**（文件头 `UF2\n`，与 `firmware.uf2` 字节完全相同），每个块内嵌了目标 flash 地址（OTA1=0xB000、OTA2=0x80000）。`ltchiptool flash write` 会在 PC 端解析这些地址再写入。 | ✅ **刷这个** |
+| `firmware.uf2` | 与 `firmware.bin` **内容完全一样**，只是扩展名不同。 | ✅ 刷它也一样（已实测可用） |
+
+> **结论：本项目的 `firmware.bin` 和 `firmware.uf2` 是同一份文件**（都是 UF2 容器），
+> 用 `ltchiptool flash write` 刷哪个**效果完全一样**，都能成功。README 刷机命令统一写
+> `firmware.bin`，你习惯用 `.uf2` 也完全可以。
+>
+> 这与 ESP32 / ESP8266 不同（它们的 `.bin` 是裸固件、`.uf2` 才带地址包装）；LibreTiny
+> 平台（rtl87xx）则统一用 UF2 打包固件，所以"UF2 引导程序 / U 盘拖拽烧录"的概念
+> 在本项目不适用——无论 `.bin` 还是 `.uf2`，都是交给 ltchiptool 解析写入。
+
+### 3. GitHub Actions 自动编译并发布 Release
+
+仓库已带 `.github/workflows/build.yml`，打 tag（如 `v1.0.0`）或手动触发后自动完成：
+
+1. **默认固件**（WiFi 为占位符 `your_wifi_ssid` / `your_wifi_password`）：
+   **始终编译**并发布到 **GitHub Release**，供任何人公共下载。
+   ⚠️ 默认固件**无法直接联网**——它不含你的 WiFi 凭据，刷入后仅供体验 / 二次开发，
+   需要自己按上面第 1、2 步编译个人固件。
+2. **个人固件**：如果在仓库 **Settings → Secrets and variables → Actions** 配置了
+   `WIFI_SSID` 和 `WIFI_PASSWORD`，会**额外**编译一份带个人 WiFi 的固件，
+   只上传到 Actions 运行记录的 **artifacts**（不发布到 Release，避免凭据公开），
+   仓库所有者可直接下载刷入。
+
+操作方式：
+
+- 推送 tag：`git tag v1.0.0 && git push origin v1.0.0`；
+- 或到仓库 **Actions** 页手动运行（`workflow_dispatch`）。
+
+Release 里的下载文件：
+
+| 文件 | 说明 |
+|---|---|
+| `phicomm-m1.bin` | 串口刷机用（默认固件，占位 WiFi） |
+| `phicomm-m1.uf2` | 与 `.bin` **内容完全相同**（LibreTiny UF2 容器），二选一即可 |
+
 ## 刷机
 
 ### 1. 接线
@@ -76,8 +144,6 @@ ltchiptool flash read -d COM3 RTL8710B m1_stock_backup.bin
 
 ### 3. 刷入 ESPHome 固件
 
-
-
 ```
 ltchiptool flash write -d COM3 firmware.bin
 ```
@@ -98,59 +164,6 @@ ltchiptool flash write -d COM3 firmware.bin
   ```
   整片 raw dump 没有文件头，必须手动指定 `-f RTL8710B -s 0x0`。
 - 刷机不影响 SAMD20 主控；如果以后不想用了，刷回备份即可完全还原。
-
-## 配置与编译
-
-### 1. 配置 WiFi
-
-复制凭据模板并填写：
-
-```
-cp secrets.yaml.example secrets.yaml
-```
-
-编辑 `secrets.yaml`：
-
-```yaml
-wifi_ssid: "你的WiFi名称"
-wifi_password: "你的WiFi密码"
-```
-
-`secrets.yaml` 已被 `.gitignore` 忽略，不会误提交。
-
-### 2. 本地编译
-
-需要 Python 环境：
-
-```
-pip install esphome
-esphome compile esphome-phicomm-m1.yaml
-```
-
-产物在 `.esphome/build/phicomm-m1/.pioenvs/phicomm-m1/`：
-
-- `firmware.bin` —— 串口烧录用；
-- `firmware.uf2` —— 支持 UF2 引导的板子用（本机一般用不到）。
-
-也可以接好 USB-TTL 后直接编译并烧录：
-
-```
-esphome run esphome-phicomm-m1.yaml
-```
-
-后续小改动建议走 **OTA**（`esphome upload` 或 HA 里的 ESPHome 集成），不用拆机。
-
-### 3. GitHub Actions 自动编译并发布 Release
-
-仓库已带 `.github/workflows/build.yml`：
-
-1. 把 `WIFI_SSID` 和 `WIFI_PASSWORD` 添加到仓库的
-   **Settings → Secrets and variables → Actions**；
-2. 推送形如 `v1.0.0` 的 tag，Actions 会自动编译固件并发布到 **GitHub Release**
-   （`firmware.bin` + `firmware.uf2`）；
-3. 也可以在 Actions 页面手动触发（`workflow_dispatch`）。
-
-发布后下载 `firmware.bin`，用 `ltchiptool` 按上面第 3 步刷入即可。
 
 ## 相关文档
 
