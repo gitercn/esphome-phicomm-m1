@@ -57,10 +57,24 @@ api:
 ota:
   platform: esphome
 
+# 首次配置向导：连不上主 WiFi 时开启 fallback AP，手机连接后自动弹出 WiFi
+# 配置页（也支持访问 192.168.4.1），输入自家 WiFi 即保存联网，无需编译。
+captive_portal:
+
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
-  # WiFi 状态灯：连接成功 = PA5 常亮；断开 = PA12 红叉亮。
+  # —— 首次配置热点（fallback AP）——
+  # 默认固件的 WiFi 是占位符（your_wifi_ssid/your_wifi_password），必然连不上；
+  # 此时自动开启配置热点。手机连接该热点后 captive portal 会自动弹出配置页，
+  # 输入自家 WiFi 账号密码保存后，固件重启联网——不会编译的用户也能直接用。
+  # 个人固件（已填真实 WiFi）连接正常时不会开启此热点。
+  ap:
+    ssid: "Phicomm-M1-Setup"
+    password: "12345678"        # WPA2 最少 8 位；仅用于首次配置
+    ap_timeout: 5min          # 热点持续 5 分钟，然后关闭重试主 WiFi；配置成功后自动关闭
+
+# WiFi 状态灯：连接成功 = PA5 常亮；断开 = PA12 红叉亮。
   # 受 "Indicator LEDs" 总开关（g_led_enable）控制：总开关关闭后，
   # WiFi 状态变化不再强制点亮 LED（夜间关灯后重启保持全灭）。
   on_connect:

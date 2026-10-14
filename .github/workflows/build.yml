@@ -83,7 +83,9 @@ jobs:
             - `phicomm-m1.bin`：串口刷机用（`ltchiptool flash write` 直接写入）
             - `phicomm-m1.uf2`：与 `.bin` 内容完全相同（LibreTiny UF2 容器），二选一即可
 
-            > ⚠️ 本 Release 是**默认固件**，WiFi 为占位符 `your_wifi_ssid` / `your_wifi_password`，
-            > **刷入后无法联网**。请按 README 自行编译配置个人 WiFi 的固件；
+            > ℹ️ 本 Release 是**默认固件**（WiFi 为占位符 `your_wifi_ssid` / `your_wifi_password`），
+            > **内置首次配置向导**：连不上占位 WiFi 时自动开启配置热点 `Phicomm-M1-Setup`
+            > （密码 `12345678`），手机连接后用网页填入自家 WiFi 即可保存联网，**无需编译**。
+            > 详细步骤见仓库 README「默认固件免编译体验」。
             > 若仓库配置了 `WIFI_SSID` / `WIFI_PASSWORD` secrets，可在本次
             > Actions 运行记录的 artifacts 中下载带个人 WiFi 的 `*-personal` 固件。
