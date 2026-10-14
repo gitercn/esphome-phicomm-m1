@@ -1,0 +1,53 @@
+name: Build ESPHome firmware
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create secrets.yaml from repo secrets
+        run: |
+          if [ -z "${{ secrets.WIFI_SSID }}" ]; then
+            echo "::error::WIFI_SSID secret is not configured."
+            echo "Please add WIFI_SSID and WIFI_PASSWORD to Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+          if [ -z "${{ secrets.WIFI_PASSWORD }}" ]; then
+            echo "::error::WIFI_PASSWORD secret is not configured."
+            exit 1
+          fi
+          echo "wifi_ssid: \"${{ secrets.WIFI_SSID }}\"" > secrets.yaml
+          echo "wifi_password: \"${{ secrets.WIFI_PASSWORD }}\"" >> secrets.yaml
+
+      - name: Compile firmware (ESPHome docker)
+        run: |
+          docker run --rm -v "${PWD}":/config -w /config esphome/esphome \
+            compile esphome-phicomm-m1.yaml
+
+      - name: Upload firmware artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: phicomm-m1-firmware
+          path: |
+            .esphome/build/phicomm-m1/.pioenvs/phicomm-m1/firmware.bin
+            .esphome/build/phicomm-m1/.pioenvs/phicomm-m1/firmware.uf2
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            .esphome/build/phicomm-m1/.pioenvs/phicomm-m1/firmware.bin
+            .esphome/build/phicomm-m1/.pioenvs/phicomm-m1/firmware.uf2

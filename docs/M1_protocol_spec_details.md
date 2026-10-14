@@ -135,8 +135,8 @@ EMW3080 把命令（亮度、开关、时间）用反向 12 字节帧发给 SAMD
    `GPIO_21→PA30、GPIO_22→PA29、GPIO_23→PA8、GPIO_19→PA11、GPIO_13→PA12、
    GPIO_14→PA5、GPIO_12→PA0、GPIO_9→PA23、GPIO_10→PA18、GPIO_8→PA19、
    GPIO_7→PA22、GPIO_1→PA14、GPIO_2→PA15`。
-   （本仓库已放大存档：`mx1290_pin` RTL8710BN、
-   `rtl8710bn_pin.png` MX1290。）
+   （本仓库已放大存档：`docs/mx1290_pin.png`、`docs/rtl8710bn_pin.png`，
+   均为 A_D Electronics 拆解文中 MX1290 与 RTL8710BN 的 QFN-32 引脚图。）
 2. **RTL8710B SDK**（`framework-realtek-amb1`，`serial_api.c` + `rtl8711b_rcc.h`）：
    UART0: TX=PA23(或PA4)、RX=PA18(或PA1)；UART2=LOGUART=**下载/日志口** PA30/PA29
    （`APBPeriph_LOGUART = BIT_PERI_UART2_EN`）。
