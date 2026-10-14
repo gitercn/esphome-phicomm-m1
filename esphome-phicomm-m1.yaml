@@ -1,0 +1,636 @@
+#
+# 斐讯悟空 M1 空气检测仪 — ESPHome 固件
+#
+# 通过 EMW3080 模块（RTL8710B）的 UART0（模块 9/10 脚 = PA23/PA18）与
+# 主控 SAMD20 通信，读取甲醛/温度/湿度/PM2.5 并控制屏幕。
+#
+# 传感器帧（SAMD20 → 模块，20 字节，帧头 0x23 / 帧尾 0x21）：
+#   23 01 00 0a 00 1b 10 43 58 00 00 01 01 01 00 00 00 00 00 21
+#   [2:3] = 甲醛 raw（÷1000 = mg/m³）
+#   [5]   = 温度整数 (°C)
+#   [6]   = 温度小数（百分位 0–99，真实值 = 整数 + [6]/100）
+#   [7]   = 湿度整数 (%RH)
+#   [8]   = 湿度小数（百分位 0–99，真实值 = 整数 + [8]/100）
+#   [9:10] = PM2.5 (µg/m³)
+#
+esphome:
+  name: phicomm-m1
+  on_boot:
+    # 开机恢复：从 preferences 恢复屏幕亮度/开关状态并发 0x02 帧，
+    # 同时把查询间隔从 number 恢复值同步到 globals。
+    # priority -100（LATE）：此时 logger 已就绪，日志可靠。
+    #
+    # 冷启动时序注意：RTL8710B 启动比 SAMD20 快，on_boot 时 SAMD20 的 UART
+    # 尚未就绪（其 0x17 开机应答在 ESP setup 完成后约 1.1s 才到），此时发出的
+    # 0x02 帧会被 SAMD20 丢弃（实测：启动时发 23 02 64 01 + 23 02 00 00，
+    # 屏幕保持默认开，且无 0x0C RTC 响应）。因此：
+    #   - 热重启（SAMD20 未复位）：on_boot 立即执行的 apply_screen_state 直接生效；
+    #   - 冷启动（SAMD20 同时复位）：apply_screen_state 的帧被丢弃，等 UART lambda
+    #     收到 0x17 后再次执行 apply_screen_state（mode: restart 会取消上一次运行
+    #     并重新从握手帧开始），确保 SAMD20 收到的第一个 0x02 是带开屏标志的握手帧。
+    - priority: -100
+      then:
+        # ① 立即发布恢复的屏幕状态到 HA（不等 UART 帧生效）
+        - lambda: |-
+            id(bs_scr_on).publish_state(id(g_scr_on));
+            id(scr_sw).publish_state(id(g_scr_on));
+        # ② 应用屏幕状态（握手帧 → 300ms → 恢复帧），热重启时立即生效
+        - script.execute: apply_screen_state
+        # 同步 0x01 查询间隔：number 恢复值 -> globals（首次上电/恢复出厂 = 5s）
+        - lambda: |-
+            id(g_query_interval_ms) = (uint32_t)(id(q_int_num).state * 1000.0f);
+            id(g_last_query_ms) = millis();
+
+rtl87xx:
+  board: generic-rtl8710bn-2mb-468k
+  framework:
+    # 固定 LibreTiny 1.10.0：v1.12.x 起 UART0 RX 存在回归（TX 正常、RX 收不到数据），
+    # v1.13.0 仍未修复；v1.10.0 是最后一个 RX 正常的版本。
+    version: 1.10.0
+
+logger:
+  baud_rate: 115200    # 日志走 UART2（PA30=TX，模块 24 脚），USB-TTL 可抓
+  hardware_uart: UART2
+  level: DEBUG         # DEBUG 才能看到逐帧 hex（uart_debug 标签）
+
+api:
+ota:
+  platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # WiFi 状态灯：连接成功 = PA5 常亮；断开 = PA12 红叉亮。
+  # 受 "Indicator LEDs" 总开关（g_led_enable）控制：总开关关闭后，
+  # WiFi 状态变化不再强制点亮 LED（夜间关灯后重启保持全灭）。
+  on_connect:
+    - if:
+        condition:
+          lambda: 'return id(g_led_enable);'
+        then:
+          - switch.turn_on: led_wifi
+          - switch.turn_off: led_wifi_fail
+  on_disconnect:
+    - if:
+        condition:
+          lambda: 'return id(g_led_enable);'
+        then:
+          - switch.turn_off: led_wifi
+          - switch.turn_on: led_wifi_fail
+
+# ——— 应用 UART（模块 9/10 脚 ↔ SAMD20，115200 8N1，帧 0x23..0x21）———
+uart:
+  id: probe_uart
+  tx_pin: PA23          # 模块 9 脚  = UART0_TXD → SAMD20 RX
+  rx_pin: PA18          # 模块 10 脚 = UART0_RXD ← SAMD20 TX
+  baud_rate: 115200
+  data_bits: 8
+  parity: NONE
+  stop_bits: 1
+  rx_buffer_size: 512
+  debug:
+    direction: BOTH        # 收发都打印 hex
+    dummy_receiver: true
+    after:
+      timeout: 20ms
+    sequence:
+      - lambda: |-
+          // —— 逐帧 hex 打印（DEBUG 级，由 "Debug Hex Print" 开关控制）——
+          if (id(dbg_hex_en)) {
+            UARTDebug::log_hex(direction, bytes, ' ');
+          }
+
+          if (direction != UART_DIRECTION_RX) return;
+          // —— 切帧：固定 20 字节滑动窗口 + 帧头 0x23 / 帧尾 0x21 校验 ——
+          static std::vector<uint8_t> rx_buf;
+          rx_buf.insert(rx_buf.end(), bytes.begin(), bytes.end());
+          while (rx_buf.size() >= 20) {
+            if (rx_buf[0] != 0x23 || rx_buf[19] != 0x21) {
+              rx_buf.erase(rx_buf.begin());     // 滑动窗口：丢 1 字节重新对齐
+              continue;
+            }
+            std::vector<uint8_t> frame(rx_buf.begin(), rx_buf.begin() + 20);
+            rx_buf.erase(rx_buf.begin(), rx_buf.begin() + 20);
+
+            if (frame[1] == 0x01) {
+              // cmd 0x01 = 传感器上报帧
+              //   [2:3]   HCHO raw，÷1000 = mg/m³
+              //   [5]     温度整数 °C
+              //   [6]     温度小数（百分位，屏幕实测确认）
+              //   [7]     湿度整数 %RH
+              //   [8]     湿度小数（百分位，屏幕实测确认）
+              //   [9:10]  PM2.5 µg/m³
+              uint16_t hcho = (uint16_t)(frame[2] << 8 | frame[3]);
+              uint8_t temp_i = frame[5];
+              uint8_t humi_i = frame[7];
+              uint16_t pm25 = (uint16_t)(frame[9] << 8 | frame[10]);
+
+              ESP_LOGD("m1", "sensor raw: hcho=%u temp=%u.%02u humi=%u.%02u pm25=%u",
+                       hcho, temp_i, frame[6], humi_i, frame[8], pm25);
+
+              id(sen_hcho).publish_state(hcho / 1000.0f);
+              id(sen_temp).publish_state(temp_i + frame[6] / 100.0f);
+              id(sen_humi).publish_state(humi_i + frame[8] / 100.0f);
+              id(sen_pm25).publish_state(pm25);
+            } else if (frame[1] == 0x0C) {
+              // cmd 0x0C = RTC 时间广播（收到 0x02/0x03 后触发，之后约每 57s 一次）
+              // 帧格式：23 0c [年高][年低] [月] [日] [时] [分] [秒] 00 ... 21
+              // 年 = 16 位大端（0x07EA = 2026）；RTC 未校时显示 2000-00-00 00:00
+              uint16_t yr = (uint16_t)(frame[2] << 8 | frame[3]);
+              uint8_t mo = frame[4];
+              uint8_t dy = frame[5];
+              uint8_t hh = frame[6];
+              uint8_t mi = frame[7];
+              uint8_t ss = frame[8];
+              id(g_0c_cnt)++;
+              ESP_LOGI("m1", "RTC time: %04u/%02u/%02u %02u:%02u:%02u (#%u)",
+                       yr, mo, dy, hh, mi, ss, (unsigned) id(g_0c_cnt));
+              id(sen_0c_cnt).publish_state(id(g_0c_cnt));
+              // 只有年份 > 2000（已校时）才发布，避免 2000-00-00 污染 RTC 传感器
+              if (yr > 2000) {
+                id(sen_rtc_year).publish_state(yr);
+                id(sen_rtc_month).publish_state(mo);
+                id(sen_rtc_day).publish_state(dy);
+                id(sen_rtc_hour).publish_state(hh);
+                id(sen_rtc_min).publish_state(mi);
+                id(sen_rtc_sec).publish_state(ss);
+              }
+              char rawbuf[80];
+              snprintf(rawbuf, sizeof(rawbuf),
+                       "%04u-%02u-%02u %02u:%02u:%02u  |  23 0c %02X %02X %02X %02X "
+                       "%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X "
+                       "%02X %02X 21",
+                       yr, mo, dy, hh, mi, ss,
+                       frame[2], frame[3], frame[4], frame[5], frame[6], frame[7],
+                       frame[8], frame[9], frame[10], frame[11], frame[12], frame[13],
+                       frame[14], frame[15], frame[16], frame[17], frame[18]);
+              id(txt_0c_raw).publish_state(rawbuf);
+            } else if (frame[1] == 0x0F) {
+              // cmd 0x0F = 屏幕开/关状态通知（SAMD20 在物理按键开关屏时发送）
+              //   frame[2] == 0x00 → 屏幕关；0x01 → 屏幕开
+              // 同步 g_scr_on（restore_value: true），重启后保持屏幕开关状态。
+              bool scr_on = frame[2] != 0;
+              ESP_LOGI("m1", "screen state: %s", scr_on ? "ON" : "OFF");
+              id(g_scr_on) = scr_on;
+              id(bs_scr_on).publish_state(scr_on);
+              id(scr_sw).publish_state(scr_on);
+            } else if (frame[1] == 0x18) {
+              // cmd 0x18 = 长按前面板按键事件：SAMD20 进入"恢复出厂确认"状态（屏幕变黄），
+              // 以 ~1.0s 间隔持续重发 0x18，直到收到 0x16 应答。
+              // 收到 0x18 后回发固定 0x16 应答帧，并计数；计数 >1 触发恢复出厂 + 重启。
+              ESP_LOGW("m1", "rx cmd 0x18: long-press event #%u, sending 0x16 ack",
+                       (unsigned) id(g_18_cnt) + 1);
+              uint8_t ack_16[12] = {0x23, 0x16, 0x00, 0x10, 0x14, 0x00,
+                                    0x03, 0x10, 0xF1, 0xFF, 0xFF, 0x21};
+              id(probe_uart).write_array(ack_16, sizeof(ack_16));
+              id(g_18_cnt)++;
+              if (id(g_18_cnt) > 1) {
+                // 计数 >1 = 长按"恢复出厂"并重启：
+                // 清除 preferences 中所有 restore_value 的配置（亮度/屏幕开关/查询间隔/
+                // hex 打印等全部回到 initial_value 默认值），然后重启。WiFi 凭据编译在
+                // 固件镜像内不存 preferences，重启后自动重连已配置 WiFi。
+                ESP_LOGW("m1", "0x18 count=%u > 1: factory reset (clearing saved settings), rebooting",
+                         (unsigned) id(g_18_cnt));
+                id(probe_uart).set_timeout(250, []() {
+                  global_preferences->reset();   // 清空所有 restore_value 存储
+                  // reset() 内部 fdb_kv_set_default(擦除) + fdb_kvdb_deinit(使 FlashDB
+                  // 失效)。而 App.safe_reboot() 的 shutdown 钩子（safe_mode 组件保存 boot
+                  // 计数器 RTC_KEY=233825507）还会触发一次 preferences sync，此时
+                  // fdb_kv_set_blob 检测到 db 未初始化，返回 FDB_INIT_FAILED(=8)，日志出现
+                  // "Last error=8 for key=233825507"。这里重新 open() 使数据库恢复有效，
+                  // 让 shutdown 期的写入正常落盘，消除该错误。
+                  global_preferences->open();
+                  App.safe_reboot();
+                });
+              }
+            } else if (frame[1] == 0x17) {
+              // 0x17 = SAMD20 开机应答（其 UART 外设就绪时自动发送一次）。
+              // 冷启动时 on_boot 的 apply_screen_state 发得太早（SAMD20 未就绪，
+              // 0x02 帧被丢弃，屏幕保持默认开），收到 0x17 后重新执行握手+恢复。
+              // script mode: restart 会取消上一次未完成的运行，重新从握手帧开始，
+              // 保证 SAMD20 收到的第一个 0x02 帧是带开屏标志的 23 02 64 01。
+              ESP_LOGI("m1", "SAMD20 ready: re-running screen restore");
+              id(apply_screen_state).execute();
+            } else {
+              // 0x07 = "errorup"（传感器未就绪，开机数秒内出现，正常）
+              ESP_LOGI("m1", "rx cmd 0x%02X (ignored)", (unsigned) frame[1]);
+            }
+          }  // end while (rx_buf) 滑动窗口切帧
+
+sensor:
+  - platform: template
+    id: sen_hcho
+    name: "M1 Formaldehyde"
+    device_class: volatile_organic_compounds
+    unit_of_measurement: "mg/m³"
+    accuracy_decimals: 3
+    state_class: measurement
+    update_interval: never      # 只由 UART lambda 推送
+  - platform: template
+    id: sen_temp
+    name: "M1 Temperature"
+    device_class: temperature
+    unit_of_measurement: "°C"
+    accuracy_decimals: 2        # 小数位（百分位）来自帧 [6]/[8]，屏幕实测确认
+    state_class: measurement
+    update_interval: never
+  - platform: template
+    id: sen_humi
+    name: "M1 Humidity"
+    device_class: humidity
+    unit_of_measurement: "%"
+    accuracy_decimals: 2        # 小数位（百分位）来自帧 [6]/[8]，屏幕实测确认
+    state_class: measurement
+    update_interval: never
+  - platform: template
+    id: sen_pm25
+    name: "M1 PM2.5"
+    device_class: pm25
+    unit_of_measurement: "µg/m³"
+    accuracy_decimals: 0
+    state_class: measurement
+    update_interval: never
+  # —— cmd 0x0C RTC 时间广播解析结果（约每 57s 更新）——
+  - platform: template
+    id: sen_0c_cnt
+    name: "M1 0x0C Frame Count"
+    accuracy_decimals: 0
+    state_class: measurement
+    update_interval: never
+  - platform: template
+    id: sen_rtc_year
+    name: "M1 RTC Year"
+    accuracy_decimals: 0
+    update_interval: never
+  - platform: template
+    id: sen_rtc_month
+    name: "M1 RTC Month"
+    accuracy_decimals: 0
+    update_interval: never
+  - platform: template
+    id: sen_rtc_day
+    name: "M1 RTC Day"
+    accuracy_decimals: 0
+    update_interval: never
+  - platform: template
+    id: sen_rtc_hour
+    name: "M1 RTC Hour"
+    accuracy_decimals: 0
+    update_interval: never
+  - platform: template
+    id: sen_rtc_min
+    name: "M1 RTC Minute"
+    accuracy_decimals: 0
+    update_interval: never
+  - platform: template
+    id: sen_rtc_sec
+    name: "M1 RTC Second"
+    accuracy_decimals: 0
+    update_interval: never
+
+text_sensor:
+  - platform: template
+    id: txt_0c_raw
+    name: "M1 0x0C RTC Time"
+    update_interval: never
+
+# ——— 全局状态 ———
+globals:
+  # —— 用户配置（restore_value: true）：重启后保留；长按 0x18 计数 >1 恢复出厂后回到 initial_value ——
+  - id: dbg_hex_en
+    type: bool
+    restore_value: true
+    initial_value: 'true'       # 逐帧 hex 打印；默认开，恢复出厂后回到开
+  - id: g_query_interval_ms
+    type: uint32_t
+    restore_value: true
+    initial_value: '5000'       # 0x01 查询间隔（毫秒），由 q_int_num 运行时修改，0=关闭
+  - id: g_scr_on
+    type: bool
+    restore_value: true
+    initial_value: 'true'       # 屏幕开关状态；默认开，恢复出厂后回到开
+  - id: g_led_enable
+    type: bool
+    restore_value: true
+    initial_value: 'true'      # 指示灯总开关；默认开（WiFi 状态灯生效），
+                                # 夜间关掉后持久化，重启保持全灭（长按恢复出厂后回到开）
+  # —— 运行期状态（restore_value: no）：重启即清零，不持久化 ——
+  - id: g_0c_cnt
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'          # 收到的 0x0C RTC 广播帧计数
+  - id: g_18_cnt
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'          # 收到的 0x18 长按事件计数，>1 触发恢复出厂+重启（重启清零）
+  - id: g_last_query_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'          # 上次发送 0x01 查询的 millis()，供 1s 心跳判断
+
+switch:
+  # WiFi 状态灯（PA5=WiFi 图标灯，PA12=红叉灯）
+  - platform: gpio
+    pin: PA5
+    id: led_wifi
+    name: "WiFi LED (PA5)"
+    restore_mode: ALWAYS_OFF
+  - platform: gpio
+    pin: PA12
+    id: led_wifi_fail
+    name: "WiFi X LED (PA12)"
+    restore_mode: ALWAYS_OFF
+  # —— 指示灯总开关 ——
+  # 关闭后 WiFi 状态变化不再点亮 PA5/PA12（夜间关灯后重启保持全灭）。
+  # restore_mode: DISABLED：状态由 lambda 跟随 g_led_enable（globals restore_value
+  # 持久化），避免 template switch 启动时按 restore_mode 触发覆盖。
+  - platform: template
+    name: "Indicator LEDs"
+    id: led_en_sw
+    icon: "mdi:lightbulb-group"
+    restore_mode: DISABLED
+    lambda: return id(g_led_enable);
+    turn_on_action:
+      - globals.set:
+          id: g_led_enable
+          value: 'true'
+      - lambda: |-
+          // 恢复 WiFi 状态指示：已连接 → PA5 亮；未连接 → PA12 红叉亮
+          if (wifi::global_wifi_component->is_connected()) {
+            id(led_wifi).turn_on();
+            id(led_wifi_fail).turn_off();
+          } else {
+            id(led_wifi).turn_off();
+            id(led_wifi_fail).turn_on();
+          }
+      - logger.log:
+          format: "indicator LEDs ON (WiFi state lights enabled)"
+          level: INFO
+    turn_off_action:
+      - globals.set:
+          id: g_led_enable
+          value: 'false'
+      - switch.turn_off: led_wifi
+      - switch.turn_off: led_wifi_fail
+      - logger.log:
+          format: "indicator LEDs OFF (all state lights off, preserved across reboot)"
+          level: INFO
+  # 调试用 GPIO 标记（可自行删减）
+  - platform: gpio
+    pin: PA0
+    id: boot_marker
+    name: "Boot marker (PA0)"
+    restore_mode: ALWAYS_OFF
+  - platform: gpio
+    pin: PA8
+    id: handshake_marker
+    name: "PA8 handshake marker (pin23)"
+    restore_mode: ALWAYS_OFF
+  # 模块 19 脚 BOOT=PA11：启动 strap，拉低后复位会进下载模式——保持 ALWAYS_OFF
+  - platform: gpio
+    pin: PA11
+    id: boot_sysled
+    name: "PA11 (pin19 BOOT-SYS_LED)"
+    restore_mode: ALWAYS_OFF
+  # 逐帧 hex 打印开关（状态由 dbg_hex_en 恢复值决定，重启后保留上次选择）
+  # restore_mode: DISABLED —— 不依赖 template switch 自身的恢复机制（它会按
+  # restore_mode 在启动时触发 turn_on/turn_off action 覆盖 dbg_hex_en），
+  # 状态完全由下方 lambda 跟随 dbg_hex_en（globals restore_value: true 持久化）。
+  - platform: template
+    name: "Debug Hex Print"
+    id: dbg_hex_sw
+    restore_mode: DISABLED
+    lambda: return id(dbg_hex_en);
+    turn_on_action:
+      - globals.set:
+          id: dbg_hex_en
+          value: 'true'
+      - logger.log:
+          format: "hex print ON"
+          level: INFO
+    turn_off_action:
+      - globals.set:
+          id: dbg_hex_en
+          value: 'false'
+      - logger.log:
+          format: "hex print OFF"
+          level: INFO
+
+  # —— 屏幕开关（cmd 0x02）——
+  # restore_mode: DISABLED：状态完全由 lambda 跟随 g_scr_on（globals restore_value
+  # 持久化），避免 template switch 启动时按 restore_mode 触发 turn_on/turn_off 覆盖。
+  # turn_on 用当前亮度档位 + 开屏标志 0x01；turn_off 发亮度 0 + 关屏标志 0x00。
+  - platform: template
+    name: "M1 Screen"
+    id: scr_sw
+    icon: "mdi:monitor"
+    restore_mode: DISABLED
+    lambda: return id(g_scr_on);
+    turn_on_action:
+      - globals.set:
+          id: g_scr_on
+          value: 'true'
+      - binary_sensor.template.publish:
+          id: bs_scr_on
+          state: ON
+      - lambda: |-
+          uint8_t b = (uint8_t) id(br_num).state;
+          uint8_t level = (uint8_t)((b + 12) / 25);
+          if (level > 4) level = 4;
+          uint8_t frame[12] = {0x23, 0x02, (uint8_t)(level * 25), 0x01, 0, 0, 0, 0, 0, 0, 0, 0x21};
+          id(probe_uart).write_array(frame, sizeof(frame));
+          ESP_LOGI("m1", "screen ON (brightness %u%%)", (unsigned)(level * 25));
+    turn_off_action:
+      - globals.set:
+          id: g_scr_on
+          value: 'false'
+      - binary_sensor.template.publish:
+          id: bs_scr_on
+          state: OFF
+      - uart.write:
+          id: probe_uart
+          data: [0x23, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x21]
+      - logger.log:
+          format: "screen OFF (brightness 0, off flag 0)"
+          level: INFO
+
+# ——— cmd 0x0F 屏幕开/关状态（SAMD20 在物理按键开关屏时发送）———
+# 开机时由 on_boot 发布 g_scr_on 恢复值作为初始状态。
+binary_sensor:
+  - platform: template
+    id: bs_scr_on
+    name: "M1 Screen State"
+
+# ——— 亮度设置（cmd 0x02）——拖动即生效：set_action 里直接量化并发帧——
+# restore_value: true：重启后保留上次亮度；设置亮度即开屏，同步更新 g_scr_on。
+number:
+  - platform: template
+    name: "M1 Brightness"
+    id: br_num
+    unit_of_measurement: "%"
+    min_value: 0
+    max_value: 100
+    step: 25                 # 屏幕只认 0..4 五档（byte = level*25）
+    mode: slider
+    optimistic: true
+    restore_value: true
+    initial_value: 100
+    set_action:
+      - logger.log:
+          format: "brightness target = %.0f%%"
+          args: ['x']
+          level: INFO
+      - globals.set:
+          id: g_scr_on
+          value: 'true'      # 设置亮度 = 开屏
+      - binary_sensor.template.publish:
+          id: bs_scr_on
+          state: ON
+      - switch.template.publish:
+          id: scr_sw
+          state: ON
+      - lambda: |-
+          // 屏幕只接受 {0,25,50,75,100} 五档（其余值被忽略），
+          // 四舍五入量化后带开屏标志 0x01 发送。
+          uint8_t b = (uint8_t) x;
+          uint8_t level = (uint8_t)((b + 12) / 25);
+          if (level > 4) level = 4;
+          uint8_t frame[12] = {0x23, 0x02, (uint8_t)(level * 25), 0x01, 0, 0, 0, 0, 0, 0, 0, 0x21};
+          id(probe_uart).write_array(frame, sizeof(frame));
+          ESP_LOGI("m1", "brightness applied: level %u -> %u%% (screen on)",
+                   (unsigned) level, (unsigned) (level * 25));
+
+  # ---- cmd 0x01 查询间隔：0=关闭查询，1..3600=秒 ----
+  - platform: template
+    name: "M1 Query Interval"
+    id: q_int_num
+    unit_of_measurement: "s"
+    icon: "mdi:timer-sand"
+    min_value: 0
+    max_value: 3600
+    step: 1
+    mode: slider
+    optimistic: true
+    restore_value: true
+    initial_value: 5
+    set_action:
+      - logger.log:
+          format: "0x01 query interval = %.0f s (%s)"
+          args: ['x', 'x == 0 ? "disabled" : "enabled"']
+          level: INFO
+      - lambda: |-
+          // 更新查询间隔；0=关闭查询。同时重置相位，从新间隔生效时刻重新计时。
+          id(g_query_interval_ms) = (uint32_t)(x * 1000.0f);
+          id(g_last_query_ms) = millis();
+
+button:
+  # 重启按钮：受控重启，不经过 OTA
+  - platform: restart
+    name: "M1 Restart"
+  # —— 协议调试按钮 ——
+  - platform: template
+    name: "Send 0x01 query"
+    on_press:
+      - uart.write:
+          id: probe_uart
+          data: [0x23, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x21]
+  - platform: template
+    name: "Send 0x02 handshake (brightness=100, on)"
+    on_press:
+      - uart.write:
+          id: probe_uart
+          data: [0x23, 0x02, 0x64, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x21]
+  - platform: template
+    name: "Send 0x03 set-time (zero base)"
+    on_press:
+      - uart.write:
+          id: probe_uart
+          data: [0x23, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x21]
+  - platform: template
+    name: "Send 0x16 button-ack"
+    on_press:
+      - uart.write:
+          id: probe_uart
+          data: [0x23, 0x16, 0x00, 0x10, 0x14, 0x00, 0x03, 0x10, 0xf1, 0xff, 0xff, 0x21]
+  # —— 校时按钮（手动触发 cmd 0x03，用 NTP 当前时间）——
+  - platform: template
+    name: "Set RTC Time (now)"
+    on_press:
+      - script.execute: send_rtc_time
+
+# ——— 网络时间 → SAMD20 RTC（cmd 0x03）———
+# 帧格式：23 03 [年高][年低] [月] [日] [时] [分] [秒] 00 00 21
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: Asia/Shanghai
+    on_time_sync:
+      - script.execute: send_rtc_time
+
+script:
+  # 应用屏幕亮度/开关状态：先发原厂标准握手帧（亮度100 + 开屏标志 0x01），
+  # 300ms 后再应用恢复的亮度/开关（低亮度/关屏帧）。
+  # mode: restart：冷启动时 on_boot 的调用会被 SAMD20 未就绪丢弃，
+  # 收到 0x17 后再次 execute 会取消未完成的旧运行，从握手帧重新开始，
+  # 保证 SAMD20 收到的第一个 0x02 帧总是带开屏标志的握手帧。
+  - id: apply_screen_state
+    mode: restart
+    then:
+      # ① 原厂标准握手帧（亮度100 + 开屏标志 0x01）：
+      #    SAMD20 上电默认开屏，且第一个 0x02 帧只有带开屏标志才会完整应用
+      #    屏幕设置（实测直接发 23 02 00 00 关屏帧，数据推送正常但屏幕保持默认开）。
+      #    原厂 uart_thread 启动时也正是发送 23 02 64 01 ... 21。
+      - uart.write:
+          id: probe_uart
+          data: [0x23, 0x02, 0x64, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x21]
+      - delay: 300ms
+      # ② 再应用恢复的屏幕状态：此时 SAMD20 已完成握手，运行中的 0x02 帧
+      #    会正常执行亮度/关屏设置（实测运行中 23 02 00 00 能关屏）。
+      - lambda: |-
+          uint8_t b = (uint8_t) id(br_num).state;
+          uint8_t level = (uint8_t)((b + 12) / 25);
+          if (level > 4) level = 4;
+          bool scr_on = id(g_scr_on);
+          uint8_t frame[12] = {0x23, 0x02,
+                               scr_on ? (uint8_t)(level * 25) : 0x00,
+                               scr_on ? 0x01 : 0x00,
+                               0, 0, 0, 0, 0, 0, 0, 0x21};
+          id(probe_uart).write_array(frame, sizeof(frame));
+          ESP_LOGI("m1", "screen restore applied: %s brightness=%u%%",
+                   scr_on ? "ON" : "OFF", (unsigned)(level * 25));
+  - id: send_rtc_time
+    then:
+      - lambda: |-
+          auto t = id(sntp_time).now();
+          if (!t.is_valid()) return;
+          uint16_t yr = t.year;   // 完整四位年份，如 2026
+          uint8_t frame[12] = {
+            0x23, 0x03,
+            (uint8_t)(yr >> 8), (uint8_t)(yr & 0xFF),
+            t.month, t.day_of_month, t.hour, t.minute, t.second,
+            0x00, 0x00, 0x21
+          };
+          id(probe_uart).write_array(frame, sizeof(frame));
+          ESP_LOGI("m1", "RTC set: %04u-%02u-%02u %02u:%02u:%02u",
+                   yr, t.month, t.day_of_month, t.hour, t.minute, t.second);
+
+interval:
+  # 周期轮询 0x01：SAMD20 收到 0x01 查询才回传感器帧（实测行为）
+  - interval: 1s
+    then:
+      - lambda: |-
+          // 1s 心跳驱动可调查询：0=关闭；否则每隔 g_query_interval_ms 发一次 0x01。
+          // SAMD20 收到 0x01 才回传感器帧（实测行为），间隔由 q_int_num 运行时调整。
+          if (id(g_query_interval_ms) == 0) return;
+          uint32_t now = millis();
+          if (now - id(g_last_query_ms) >= id(g_query_interval_ms)) {
+            id(g_last_query_ms) = now;
+            uint8_t q[12] = {0x23, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x21};
+            id(probe_uart).write_array(q, sizeof(q));
+          }
+  # 每 6 小时补一次校时，防止 SAMD20 RTC 漂移
+  - interval: 6h
+    then:
+      - script.execute: send_rtc_time
+
+web_server:
