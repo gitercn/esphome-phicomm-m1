@@ -27,6 +27,7 @@
 #
 esphome:
   name: phicomm-m1
+  name_add_mac_suffix: true
   on_boot:
     # 开机恢复：从 preferences 恢复屏幕亮度/开关状态并发 0x02 帧，
     # 同时把查询间隔从 number 恢复值同步到 globals。
