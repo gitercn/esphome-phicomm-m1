@@ -86,7 +86,7 @@ esphome compile esphome-phicomm-m1.yaml
 1. **默认固件**（WiFi 为占位符 `your_wifi_ssid` / `your_wifi_password`）：
    **始终编译**并发布到 **GitHub Release**，供任何人公共下载。
    ✅ 默认固件**内置首次配置向导**：连不上占位 WiFi 时自动开启配置热点
-   `Phicomm-M1-Setup`（密码 `12345678`），手机连接后用网页填入自家 WiFi 即保存联网，
+   `phicomm-m1`，手机连接后用网页填入自家 WiFi 即保存联网，
    **完全不需要编译**（详见下文「默认固件免编译体验」）。
 2. **个人固件**：如果在仓库 **Settings → Secrets and variables → Actions** 配置了
    `WIFI_SSID` 和 `WIFI_PASSWORD`，会**额外**编译一份带个人 WiFi 的固件，
