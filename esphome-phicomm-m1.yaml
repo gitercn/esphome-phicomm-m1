@@ -4,6 +4,18 @@
 # 通过 EMW3080 模块（RTL8710B）的 UART0（模块 9/10 脚 = PA23/PA18）与
 # 主控 SAMD20 通信，读取甲醛/温度/湿度/PM2.5 并控制屏幕。
 #
+# 目标：保留 web_server + api + sntp 校时 + hex 打印开关，同时尽量压缩内存占用。
+# 相比 esphome_m1.yaml 删除的调试组件：
+#   - cmd 0x0C RTC 调试传感器（sen_0c_cnt / sen_rtc_* / txt_0c_raw）
+#   - GPIO 调试标记（boot_marker PA0 / handshake_marker PA8）
+#   - 协议调试按钮（Send 0x01/0x02/0x03/0x16）
+# 保留：boot_sysled（PA11 BOOT strap 安全，保持 ALWAYS_OFF）、hex 开关、sntp 校时。
+# 内存压缩：logger tx_buffer_size 512→256、task_log_buffer_size 768→256，
+#           web_server 关闭网页 OTA（仍保留原生 ota 组件用于刷机）。
+#
+# ⚠️ 注意：web_server + api 同时运行在 RTL8710BN（堆 ~162KB）上可能仍然内存不足，
+# 如果编译后堆余量很小或运行崩溃，需在 web_server 与 api 之间二选一。
+#
 # 传感器帧（SAMD20 → 模块，20 字节，帧头 0x23 / 帧尾 0x21）：
 #   23 01 00 0a 00 1b 10 43 58 00 00 01 01 01 00 00 00 00 00 21
 #   [2:3] = 甲醛 raw（÷1000 = mg/m³）
@@ -52,6 +64,8 @@ logger:
   baud_rate: 115200    # 日志走 UART2（PA30=TX，模块 24 脚），USB-TTL 可抓
   hardware_uart: UART2
   level: DEBUG         # DEBUG 才能看到逐帧 hex（uart_debug 标签）
+  tx_buffer_size: 256       # 默认 512 → 256，省 256B 静态 RAM
+  task_log_buffer_size: 640  # 默认 768 → 640（最小值），省 128B 静态 RAM
 
 api:
 ota:
@@ -70,11 +84,11 @@ wifi:
   # 输入自家 WiFi 账号密码保存后，固件重启联网——不会编译的用户也能直接用。
   # 个人固件（已填真实 WiFi）连接正常时不会开启此热点。
   ap:
-    ssid: "Phicomm-M1-Setup"
-    password: "12345678"        # WPA2 最少 8 位；仅用于首次配置
-    ap_timeout: 5min          # 热点持续 5 分钟，然后关闭重试主 WiFi；配置成功后自动关闭
 
-# WiFi 状态灯：连接成功 = PA5 常亮；断开 = PA12 红叉亮。
+    # 开机后持续连不上主 WiFi 满 30s 即开启配置热点（ap_timeout 是"启动热点的
+    # 延迟"，不是热点持续时间）；热点开启后会一直保持，直到配置成功重启或手动重置。
+    ap_timeout: 30s
+  # WiFi 状态灯：连接成功 = PA5 常亮；断开 = PA12 红叉亮。
   # 受 "Indicator LEDs" 总开关（g_led_enable）控制：总开关关闭后，
   # WiFi 状态变化不再强制点亮 LED（夜间关灯后重启保持全灭）。
   on_connect:
@@ -156,29 +170,8 @@ uart:
               uint8_t hh = frame[6];
               uint8_t mi = frame[7];
               uint8_t ss = frame[8];
-              id(g_0c_cnt)++;
-              ESP_LOGI("m1", "RTC time: %04u/%02u/%02u %02u:%02u:%02u (#%u)",
-                       yr, mo, dy, hh, mi, ss, (unsigned) id(g_0c_cnt));
-              id(sen_0c_cnt).publish_state(id(g_0c_cnt));
-              // 只有年份 > 2000（已校时）才发布，避免 2000-00-00 污染 RTC 传感器
-              if (yr > 2000) {
-                id(sen_rtc_year).publish_state(yr);
-                id(sen_rtc_month).publish_state(mo);
-                id(sen_rtc_day).publish_state(dy);
-                id(sen_rtc_hour).publish_state(hh);
-                id(sen_rtc_min).publish_state(mi);
-                id(sen_rtc_sec).publish_state(ss);
-              }
-              char rawbuf[80];
-              snprintf(rawbuf, sizeof(rawbuf),
-                       "%04u-%02u-%02u %02u:%02u:%02u  |  23 0c %02X %02X %02X %02X "
-                       "%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X "
-                       "%02X %02X 21",
-                       yr, mo, dy, hh, mi, ss,
-                       frame[2], frame[3], frame[4], frame[5], frame[6], frame[7],
-                       frame[8], frame[9], frame[10], frame[11], frame[12], frame[13],
-                       frame[14], frame[15], frame[16], frame[17], frame[18]);
-              id(txt_0c_raw).publish_state(rawbuf);
+              ESP_LOGI("m1", "RTC time: %04u/%02u/%02u %02u:%02u:%02u",
+                       yr, mo, dy, hh, mi, ss);
             } else if (frame[1] == 0x0F) {
               // cmd 0x0F = 屏幕开/关状态通知（SAMD20 在物理按键开关屏时发送）
               //   frame[2] == 0x00 → 屏幕关；0x01 → 屏幕开
@@ -264,49 +257,6 @@ sensor:
     accuracy_decimals: 0
     state_class: measurement
     update_interval: never
-  # —— cmd 0x0C RTC 时间广播解析结果（约每 57s 更新）——
-  - platform: template
-    id: sen_0c_cnt
-    name: "M1 0x0C Frame Count"
-    accuracy_decimals: 0
-    state_class: measurement
-    update_interval: never
-  - platform: template
-    id: sen_rtc_year
-    name: "M1 RTC Year"
-    accuracy_decimals: 0
-    update_interval: never
-  - platform: template
-    id: sen_rtc_month
-    name: "M1 RTC Month"
-    accuracy_decimals: 0
-    update_interval: never
-  - platform: template
-    id: sen_rtc_day
-    name: "M1 RTC Day"
-    accuracy_decimals: 0
-    update_interval: never
-  - platform: template
-    id: sen_rtc_hour
-    name: "M1 RTC Hour"
-    accuracy_decimals: 0
-    update_interval: never
-  - platform: template
-    id: sen_rtc_min
-    name: "M1 RTC Minute"
-    accuracy_decimals: 0
-    update_interval: never
-  - platform: template
-    id: sen_rtc_sec
-    name: "M1 RTC Second"
-    accuracy_decimals: 0
-    update_interval: never
-
-text_sensor:
-  - platform: template
-    id: txt_0c_raw
-    name: "M1 0x0C RTC Time"
-    update_interval: never
 
 # ——— 全局状态 ———
 globals:
@@ -329,10 +279,6 @@ globals:
     initial_value: 'true'      # 指示灯总开关；默认开（WiFi 状态灯生效），
                                 # 夜间关掉后持久化，重启保持全灭（长按恢复出厂后回到开）
   # —— 运行期状态（restore_value: no）：重启即清零，不持久化 ——
-  - id: g_0c_cnt
-    type: uint32_t
-    restore_value: no
-    initial_value: '0'          # 收到的 0x0C RTC 广播帧计数
   - id: g_18_cnt
     type: uint32_t
     restore_value: no
@@ -389,17 +335,6 @@ switch:
       - logger.log:
           format: "indicator LEDs OFF (all state lights off, preserved across reboot)"
           level: INFO
-  # 调试用 GPIO 标记（可自行删减）
-  - platform: gpio
-    pin: PA0
-    id: boot_marker
-    name: "Boot marker (PA0)"
-    restore_mode: ALWAYS_OFF
-  - platform: gpio
-    pin: PA8
-    id: handshake_marker
-    name: "PA8 handshake marker (pin23)"
-    restore_mode: ALWAYS_OFF
   # 模块 19 脚 BOOT=PA11：启动 strap，拉低后复位会进下载模式——保持 ALWAYS_OFF
   - platform: gpio
     pin: PA11
@@ -541,31 +476,6 @@ button:
   # 重启按钮：受控重启，不经过 OTA
   - platform: restart
     name: "M1 Restart"
-  # —— 协议调试按钮 ——
-  - platform: template
-    name: "Send 0x01 query"
-    on_press:
-      - uart.write:
-          id: probe_uart
-          data: [0x23, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x21]
-  - platform: template
-    name: "Send 0x02 handshake (brightness=100, on)"
-    on_press:
-      - uart.write:
-          id: probe_uart
-          data: [0x23, 0x02, 0x64, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x21]
-  - platform: template
-    name: "Send 0x03 set-time (zero base)"
-    on_press:
-      - uart.write:
-          id: probe_uart
-          data: [0x23, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x21]
-  - platform: template
-    name: "Send 0x16 button-ack"
-    on_press:
-      - uart.write:
-          id: probe_uart
-          data: [0x23, 0x16, 0x00, 0x10, 0x14, 0x00, 0x03, 0x10, 0xf1, 0xff, 0xff, 0x21]
   # —— 校时按钮（手动触发 cmd 0x03，用 NTP 当前时间）——
   - platform: template
     name: "Set RTC Time (now)"
