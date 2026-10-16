@@ -45,7 +45,7 @@ Home Assistant。
 ```
 ├── esphome-phicomm-m1.yaml      # ESPHome 配置（固件本体，含全部 UART 协议逻辑）
 ├── secrets.yaml.example        # WiFi 凭据模板（复制为 secrets.yaml 后填写）
-├── .github/workflows/build.yml  # GitHub Actions：打 tag 自动编译并发布 Release
+├── .github/workflows/build.yml  # GitHub Actions：每次 push 自动发布滚动 Release，打 tag 发稳定版
 ├── docs/
 │   ├── M1_protocol_spec_details.md   # UART 协议文档（帧格式 / 引脚映射 / 时序）
 │   ├── M1_hardware_expansion.md      # 硬件扩展指南（空闲引脚 / 外接传感器方案）
@@ -102,7 +102,9 @@ esphome compile esphome-phicomm-m1.yaml
 
 ### 3. GitHub Actions 自动编译并发布 Release
 
-仓库已带 `.github/workflows/build.yml`，打 tag（如 `v1.0.0`）或手动触发后自动完成：
+仓库已带 `.github/workflows/build.yml`，**每次 push 到 master 自动编译**并发布到
+滚动 Release `latest`（**无需打 tag**）；打稳定版 tag（如 `v1.0.0`）或手动触发
+（Actions 页 `workflow_dispatch`）同样会构建并发布：
 
 1. **默认固件**（WiFi 为占位符 `your_wifi_ssid` / `your_wifi_password`）：
    **始终编译**并发布到 **GitHub Release**，供任何人公共下载。
@@ -114,21 +116,25 @@ esphome compile esphome-phicomm-m1.yaml
    只上传到 Actions 运行记录的 **artifacts**（不发布到 Release，避免凭据公开），
    仓库所有者可直接下载刷入。
 
-操作方式：
+操作方式（任选其一）：
 
-- 推送 tag：`git tag v1.0.0 && git push origin v1.0.0`；
+- 直接推送代码：`git push origin master` → 自动构建并更新 `latest` 滚动 Release；
+- 推送稳定版 tag：`git tag v1.0.0 && git push origin v1.0.0` → 发布到 `v1.0.0` Release；
 - 或到仓库 **Actions** 页手动运行（`workflow_dispatch`）。
 
 Release 里的下载文件：
 
 | 文件 | 说明 |
 |---|---|
-| `phicomm-m1.bin` | 串口刷机用（默认固件，占位 WiFi，带首次配置向导） |
-| `phicomm-m1.uf2` | 与 `.bin` **内容完全相同**（LibreTiny UF2 容器），二选一即可 |
+| `phicomm-m1.bin` | **唯一发布的固件文件**（默认固件，占位 WiFi，带首次配置向导） |
+
+> `.uf2` 与 `.bin` 内容完全一致（LibreTiny UF2 容器），为避免混淆 Release **只发布
+> `.bin`**。需要 `.uf2` 时可用 `ltchiptool uf2 --input phicomm-m1.bin --output phicomm-m1.uf2`
+> 一行转换；也可在每次构建的 **Actions artifacts** 里直接下载 `.uf2`。
 
 ### 4. 默认固件免编译体验（首次配置向导）
 
-不会编译的用户直接刷 Release 里的 **默认固件**（`phicomm-m1.bin` / `.uf2`），
+不会编译的用户直接刷 Release 里的 **默认固件**（`phicomm-m1.bin`），
 刷入后按下面 5 步，手机就能把 WiFi 配进去，之后正常联网使用：
 
 1. 刷入默认固件并开机，**等待约 30 秒**（`ap_timeout` 为 30 秒：持续连不上占位

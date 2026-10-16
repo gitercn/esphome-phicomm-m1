@@ -2,6 +2,8 @@ name: Build ESPHome firmware
 
 on:
   push:
+    branches:
+      - master
     tags:
       - 'v*'
   workflow_dispatch:
@@ -29,6 +31,8 @@ jobs:
         run: |
           mkdir -p dist
           cp .esphome/build/phicomm-m1/.pioenvs/phicomm-m1/firmware.bin dist/phicomm-m1.bin
+          # UF2 与 bin 内容完全一致，仅容器不同；Release 只发 .bin 避免混淆，
+          # 这里仍在 Actions artifact 里保留一份 .uf2 供需要的人取用。
           cp .esphome/build/phicomm-m1/.pioenvs/phicomm-m1/firmware.uf2 dist/phicomm-m1.uf2
 
       # ---------- ② 检查仓库是否配置 WIFI secrets ----------
@@ -71,17 +75,42 @@ jobs:
           name: phicomm-m1-personal-firmware
           path: dist-personal/
 
-      # ---------- ④ 打 tag 时发布默认固件到 GitHub Release ----------
+      # ---------- ④ 每次 push 到 master：发布滚动 Release 'latest'，无需打 tag ----------
+      - name: Publish rolling release (latest)
+        if: github.ref == 'refs/heads/master'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG=latest
+          # 幂等：删除上一次的滚动 release（连同 tag），不存在则忽略
+          gh release delete "$TAG" --yes --cleanup-tag || true
+          NOTES=$(cat <<'EOF'
+## 斐讯 M1 ESPHome 固件（master 自动构建）
+
+- `phicomm-m1.bin`：串口刷机用（`ltchiptool flash write` 直接写入）
+- 默认固件（占位 WiFi），带首次配置向导，无需编译
+- 需要 `.uf2` 时用 `ltchiptool uf2 --input phicomm-m1.bin --output phicomm-m1.uf2` 转换（内容完全一致）
+- commit: ${{ github.sha }}
+EOF
+          )
+          gh release create "$TAG" dist/phicomm-m1.bin \
+            --title "最新构建 $(date -u +%Y%m%d-%H%M)" \
+            --notes "$NOTES" \
+            --latest
+
+      # ---------- ⑤ 打 tag 时发布稳定版到 GitHub Release ----------
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*
+          files: dist/phicomm-m1.bin
           body: |
             ## 斐讯 M1 ESPHome 固件
 
             - `phicomm-m1.bin`：串口刷机用（`ltchiptool flash write` 直接写入）
-            - `phicomm-m1.uf2`：与 `.bin` 内容完全相同（LibreTiny UF2 容器），二选一即可
+            - 需要 `.uf2` 时用 `ltchiptool uf2 --input phicomm-m1.bin --output phicomm-m1.uf2` 转换
+              （内容完全一致，仅容器不同）
 
             > ℹ️ 本 Release 是**默认固件**（WiFi 为占位符 `your_wifi_ssid` / `your_wifi_password`），
             > **内置首次配置向导**：连不上占位 WiFi 时自动开启配置热点 `phicomm-m1`
