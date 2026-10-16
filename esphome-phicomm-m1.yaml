@@ -69,6 +69,7 @@ logger:
   task_log_buffer_size: 640  # 默认 768 → 640（最小值），省 128B 静态 RAM
 
 api:
+  reboot_timeout: 24h
 ota:
   platform: esphome
 
