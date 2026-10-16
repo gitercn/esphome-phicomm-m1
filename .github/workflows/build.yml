@@ -75,9 +75,9 @@ jobs:
           name: phicomm-m1-personal-firmware
           path: dist-personal/
 
-      # ---------- ④ 每次 push 到 master：发布滚动 Release 'latest'，无需打 tag ----------
+      # ---------- ④ 每次 push 到 main：发布滚动 Release 'latest'，无需打 tag ----------
       - name: Publish rolling release (latest)
-        if: github.ref == 'refs/heads/master'
+        if: github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -86,7 +86,7 @@ jobs:
           # 幂等：删除上一次的滚动 release（连同 tag），不存在则忽略
           gh release delete "$TAG" --yes --cleanup-tag || true
           NOTES=$(cat <<'EOF'
-          ## 斐讯 M1 ESPHome 固件（master 自动构建）
+          ## 斐讯 M1 ESPHome 固件（main 自动构建）
 
           - `phicomm-m1.bin`：串口刷机用（`ltchiptool flash write` 直接写入）
           - 默认固件（占位 WiFi），带首次配置向导，无需编译
