@@ -131,15 +131,20 @@ uart:
 
           if (direction != UART_DIRECTION_RX) return;
           // —— 切帧：固定 20 字节滑动窗口 + 帧头 0x23 / 帧尾 0x21 校验 ——
-          static std::vector<uint8_t> rx_buf;
-          rx_buf.insert(rx_buf.end(), bytes.begin(), bytes.end());
-          while (rx_buf.size() >= 20) {
+          // 固定数组替代 std::vector：解析路径零堆分配，消除每帧 malloc/free 与扩容
+          // 峰值（省约 250B 常驻堆 + 减少碎片）。M1 帧固定 20B，64B 余量充足；异常
+          // 风暴超过 64B 时丢弃尾部，下次回调继续滑动对齐，不影响正常功能。
+          static uint8_t rx_buf[64];
+          static uint8_t rx_len = 0;
+          for (uint8_t b : bytes) {
+            if (rx_len < sizeof(rx_buf)) rx_buf[rx_len++] = b;
+          }
+          while (rx_len >= 20) {
             if (rx_buf[0] != 0x23 || rx_buf[19] != 0x21) {
-              rx_buf.erase(rx_buf.begin());     // 滑动窗口：丢 1 字节重新对齐
+              memmove(rx_buf, rx_buf + 1, --rx_len);   // 滑动窗口：丢 1 字节重新对齐
               continue;
             }
-            std::vector<uint8_t> frame(rx_buf.begin(), rx_buf.begin() + 20);
-            rx_buf.erase(rx_buf.begin(), rx_buf.begin() + 20);
+            const uint8_t *frame = rx_buf;
 
             if (frame[1] == 0x01) {
               // cmd 0x01 = 传感器上报帧
@@ -223,6 +228,8 @@ uart:
               // 0x07 = "errorup"（传感器未就绪，开机数秒内出现，正常）
               ESP_LOGI("m1", "rx cmd 0x%02X (ignored)", (unsigned) frame[1]);
             }
+            memmove(rx_buf, rx_buf + 20, rx_len - 20);  // 移除已处理的 20 字节帧
+            rx_len -= 20;
           }  // end while (rx_buf) 滑动窗口切帧
 
 sensor:
