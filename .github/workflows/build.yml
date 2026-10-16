@@ -86,13 +86,13 @@ jobs:
           # 幂等：删除上一次的滚动 release（连同 tag），不存在则忽略
           gh release delete "$TAG" --yes --cleanup-tag || true
           NOTES=$(cat <<'EOF'
-## 斐讯 M1 ESPHome 固件（master 自动构建）
+          ## 斐讯 M1 ESPHome 固件（master 自动构建）
 
-- `phicomm-m1.bin`：串口刷机用（`ltchiptool flash write` 直接写入）
-- 默认固件（占位 WiFi），带首次配置向导，无需编译
-- 需要 `.uf2` 时用 `ltchiptool uf2 --input phicomm-m1.bin --output phicomm-m1.uf2` 转换（内容完全一致）
-- commit: ${{ github.sha }}
-EOF
+          - `phicomm-m1.bin`：串口刷机用（`ltchiptool flash write` 直接写入）
+          - 默认固件（占位 WiFi），带首次配置向导，无需编译
+          - 需要 `.uf2` 时用 `ltchiptool uf2 --input phicomm-m1.bin --output phicomm-m1.uf2` 转换（内容完全一致）
+          - commit: ${{ github.sha }}
+          EOF
           )
           gh release create "$TAG" dist/phicomm-m1.bin \
             --title "最新构建 $(date -u +%Y%m%d-%H%M)" \
