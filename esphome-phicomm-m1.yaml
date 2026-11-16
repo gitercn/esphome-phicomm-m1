@@ -18,12 +18,20 @@
 #
 # 传感器帧（SAMD20 → 模块，20 字节，帧头 0x23 / 帧尾 0x21）：
 #   23 01 00 0a 00 1b 10 43 58 00 00 01 01 01 00 00 00 00 00 21
-#   [2:3] = 甲醛 raw（÷1000 = mg/m³）
-#   [5]   = 温度整数 (°C)
-#   [6]   = 温度小数（百分位 0–99，真实值 = 整数 + [6]/100）
-#   [7]   = 湿度整数 (%RH)
-#   [8]   = 湿度小数（百分位 0–99，真实值 = 整数 + [8]/100）
+#   [2:3]  = 甲醛 raw（÷1000 = mg/m³）
+#   [4]    = 温度符号，1 = 负（f4..6 = 01 05 32 表示 -5.50°C）
+#   [5]    = 温度整数 (°C)
+#   [6]    = 温度小数（百分位 0–99，真实值 = 整数 + [6]/100）
+#   [7]    = 湿度整数 (%RH)
+#   [8]    = 湿度小数（百分位 0–99，真实值 = 整数 + [8]/100）
 #   [9:10] = PM2.5 (µg/m³)
+#   [11]   = PM 健康标志  [12] = 甲醛健康标志  [13] = 温湿度健康标志
+#
+# 本固件用到的命令帧（12 字节，[11] 恒为 0x21）：
+#   0x01 查询采样        0x02 屏幕亮度/开关      0x03 设 RTC 时间
+#   0x0e 蜂鸣器开关（f2=0 停 / 非 0 响；原厂无本地超时，必须自己发 OFF）
+#   0x11 查询主控版本（应答 23 11 [len] [ASCII…] 21，原厂返回 11.1.2.1）
+#   0x16 长按事件应答
 #
 esphome:
   name: phicomm-m1
@@ -47,9 +55,24 @@ esphome:
         - lambda: |-
             id(bs_scr_on).publish_state(id(g_scr_on));
             id(scr_sw).publish_state(id(g_scr_on));
-        # ② 应用屏幕状态（握手帧 → 300ms → 恢复帧），热重启时立即生效
+        # ② 蜂鸣器兜底 + 计时基准：清掉可能残留的 ON（上次在响时 ESP 重启 / 主控复位），
+        #    并初始化新鲜度与版本查询的计时。冷启动时这一帧会被未就绪的 SAMD20 丢弃，
+        #    收到 0x17 后会再补一次。
+        - lambda: |-
+            id(g_beep_until) = 0;
+            id(g_alarm_on) = false;
+            id(g_last_frame_ms) = millis();
+            id(g_ver_tries) = 0;
+            id(g_ver_next_ms) = millis();
+            // restore_mode: DISABLED 的 template 实体不会自己发布初始状态，
+            // 这里补一次，避免 HA 里显示 unknown
+            id(alarm_sw).publish_state(false);
+            id(bs_link).publish_state(false);
+            uint8_t off[12] = {0x23, 0x0e, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0x21};
+            id(probe_uart).write_array(off, sizeof(off));
+        # ③ 应用屏幕状态（握手帧 → 300ms → 恢复帧），热重启时立即生效
         - script.execute: apply_screen_state
-        # 同步 0x01 查询间隔：number 恢复值 -> globals（首次上电/恢复出厂 = 5s）
+        # ④ 同步 0x01 查询间隔：number 恢复值 -> globals（首次上电/恢复出厂 = 5s）
         - lambda: |-
             id(g_query_interval_ms) = (uint32_t)(id(q_int_num).state * 1000.0f);
             id(g_last_query_ms) = millis();
@@ -150,23 +173,53 @@ uart:
             if (frame[1] == 0x01) {
               // cmd 0x01 = 传感器上报帧
               //   [2:3]   HCHO raw，÷1000 = mg/m³
+              //   [4]     温度符号，1 = 负
               //   [5]     温度整数 °C
               //   [6]     温度小数（百分位，屏幕实测确认）
               //   [7]     湿度整数 %RH
               //   [8]     湿度小数（百分位，屏幕实测确认）
               //   [9:10]  PM2.5 µg/m³
+              //   [11..13] PM / 甲醛 / 温湿度健康标志
               uint16_t hcho = (uint16_t)(frame[2] << 8 | frame[3]);
               uint8_t temp_i = frame[5];
               uint8_t humi_i = frame[7];
               uint16_t pm25 = (uint16_t)(frame[9] << 8 | frame[10]);
 
-              ESP_LOGD("m1", "sensor raw: hcho=%u temp=%u.%02u humi=%u.%02u pm25=%u",
-                       hcho, temp_i, frame[6], humi_i, frame[8], pm25);
+              // 负温度：原厂 f4..6 = 01 05 32 表示 -5.50°C（f5/f6 是绝对值）
+              float temp = temp_i + frame[6] / 100.0f;
+              if (frame[4] == 1) temp = -temp;
+              float humi = humi_i + frame[8] / 100.0f;
 
-              id(sen_hcho).publish_state(hcho / 1000.0f);
-              id(sen_temp).publish_state(temp_i + frame[6] / 100.0f);
-              id(sen_humi).publish_state(humi_i + frame[8] / 100.0f);
-              id(sen_pm25).publish_state(pm25);
+              // 健康标志：0 = 该路尚无有效采样。原厂为锁存语义（采到过有效值后保持 1），
+              // 只有开源主控才在 3 次失败 / 6s 后清零，所以这里主要用来挡掉开机初期
+              // 未采到值的 0 读数；实时故障由 1s interval 的 15s 新鲜度兜底。
+              //
+              // 防误判：f[12] 在 iotcloud 的实现里被标为"未识别的辅助标志"，与开源主控
+              // 文档的"甲醛健康位"不一致。为避免某些原厂版本从不置位导致实体永久不可用，
+              // 三个标志都只在"曾经见过 1"之后才参与门控（g_h_seen 按位记录）。
+              uint8_t seen = id(g_h_seen);
+              if (frame[11]) seen |= 1;
+              if (frame[12]) seen |= 2;
+              if (frame[13]) seen |= 4;
+              id(g_h_seen) = seen;
+              bool pm_ok = frame[11] != 0 || !(seen & 1);
+              bool hcho_ok = frame[12] != 0 || !(seen & 2);
+              bool clim_ok = frame[13] != 0 || !(seen & 4);
+
+              ESP_LOGD("m1", "sensor raw: hcho=%u temp=%.2f humi=%.2f pm25=%u health=%u/%u/%u",
+                       hcho, temp, humi, pm25, frame[11], frame[12], frame[13]);
+
+              id(sen_hcho).publish_state(hcho_ok ? hcho / 1000.0f : NAN);
+              id(sen_temp).publish_state(clim_ok ? temp : NAN);
+              id(sen_humi).publish_state(clim_ok ? humi : NAN);
+              id(sen_pm25).publish_state(pm_ok ? (float) pm25 : NAN);
+
+              // 新鲜度：每收到一帧就刷新；1s interval 里 15s 未收到即置失效
+              id(g_last_frame_ms) = millis();
+              if (!id(g_link_ok)) {
+                id(g_link_ok) = true;
+                id(bs_link).publish_state(true);
+              }
             } else if (frame[1] == 0x0C) {
               // cmd 0x0C = RTC 时间广播（收到 0x02/0x03 后触发，之后约每 57s 一次）
               // 帧格式：23 0c [年高][年低] [月] [日] [时] [分] [秒] 00 ... 21
@@ -217,6 +270,26 @@ uart:
                   App.safe_reboot();
                 });
               }
+            } else if (frame[1] == 0x11) {
+              // cmd 0x11 = 主控版本应答：[2]=长度(1..16)，[3..] = ASCII 版本号。
+              // 原厂返回 11.1.2.1，开源主控为 0.9.x 之类。仅作诊断/能力判断，
+              // 不参与任何控制逻辑（版本号不能按大小推断兼容性）。
+              uint8_t n = frame[2];
+              if (n > 0 && n <= 16) {
+                char ver[17];
+                memcpy(ver, frame + 3, n);
+                ver[n] = 0;
+                while (n > 0 && ver[n - 1] == 0) ver[--n] = 0;   // 去掉尾部 0 填充
+                bool printable = n > 0;
+                for (uint8_t i = 0; i < n; i++) {
+                  if (ver[i] < 32 || ver[i] > 126) printable = false;
+                }
+                if (printable) {
+                  ESP_LOGI("m1", "MCU version: %s", ver);
+                  id(txt_mcu_ver).publish_state(ver);
+                  id(g_ver_tries) = 3;      // 已拿到，停止重试
+                }
+              }
             } else if (frame[1] == 0x17) {
               // 0x17 = SAMD20 开机应答（其 UART 外设就绪时自动发送一次）。
               // 冷启动时 on_boot 的 apply_screen_state 发得太早（SAMD20 未就绪，
@@ -225,6 +298,13 @@ uart:
               // 保证 SAMD20 收到的第一个 0x02 帧是带开屏标志的 23 02 64 01。
               ESP_LOGI("m1", "SAMD20 ready: re-running screen restore");
               id(apply_screen_state).execute();
+              // 主控重启后补一帧蜂鸣器 OFF（上次响着时主控复位/ESP 重启，0x0e 会停在
+              // ON 且原厂无本地超时），并重新查询版本号。
+              uint8_t beep_off[12] = {0x23, 0x0e, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0x21};
+              id(probe_uart).write_array(beep_off, sizeof(beep_off));
+              id(g_beep_until) = 0;
+              id(g_ver_tries) = 0;
+              id(g_ver_next_ms) = millis();
             } else {
               // 0x07 = "errorup"（传感器未就绪，开机数秒内出现，正常）
               ESP_LOGI("m1", "rx cmd 0x%02X (ignored)", (unsigned) frame[1]);
@@ -296,6 +376,45 @@ globals:
     type: uint32_t
     restore_value: no
     initial_value: '0'          # 上次发送 0x01 查询的 millis()，供 1s 心跳判断
+  # —— 采样新鲜度（运行期）——
+  - id: g_last_frame_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'          # 最近一次收到 0x01 帧的 millis()；15s 无帧即判链路失效
+  - id: g_link_ok
+    type: bool
+    restore_value: no
+    initial_value: 'false'      # 收到过帧 = true；超时后置 false（只在状态翻转时发布）
+  - id: g_h_seen
+    type: uint8_t
+    restore_value: no
+    initial_value: '0'          # bit0/1/2 = PM/甲醛/温湿度健康位是否曾为 1（防误判门控）
+  # —— 主控版本查询 0x11（运行期）——
+  - id: g_ver_tries
+    type: uint8_t
+    restore_value: no
+    initial_value: '0'          # 已尝试次数，最多 3 次；收到版本后置 3 停止
+  - id: g_ver_next_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'          # 下次查询时刻（间隔 5s）
+  # —— 蜂鸣器（运行期，一律不持久化：重启后必须回到不响）——
+  - id: g_beep_until
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'          # 蜂鸣器截止 millis；非 0 时 100ms tick 到期必发 0x0e 00
+  - id: g_alarm_on
+    type: bool
+    restore_value: no
+    initial_value: 'false'      # 告警循环开关（响 300ms / 停 1.7s）
+  - id: g_alarm_end
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'          # 告警总时限（最长 60s，自动停）
+  - id: g_alarm_next
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'          # 下一次拉响时刻（每 2s 一次）
 
 switch:
   # WiFi 状态灯（PA5=WiFi 图标灯，PA12=红叉灯）
@@ -412,12 +531,50 @@ switch:
           format: "screen OFF (brightness 0, off flag 0)"
           level: INFO
 
+  # —— 告警蜂鸣（cmd 0x0e）——
+  # 原厂 0x0e 只认开/关且「开」没有本地超时，所以停响必须由固件自己发。
+  # 这里用固定节奏：每 2s 响 300ms，最长 60s 自动停（对应 iotcloud 的 wake_alarm）。
+  # restore_mode: DISABLED —— 状态完全由 g_alarm_on 决定，重启后一定是不响。
+  - platform: template
+    name: "M1 Alarm Beep"
+    id: alarm_sw
+    icon: "mdi:alarm-light"
+    restore_mode: DISABLED
+    lambda: return id(g_alarm_on);
+    turn_on_action:
+      - lambda: |-
+          id(g_alarm_on) = true;
+          id(g_alarm_end) = millis() + 60000;
+          id(g_alarm_next) = millis();     // 下一 tick 立即拉响
+          ESP_LOGI("m1", "alarm beep ON (300ms / 2s, max 60s)");
+    turn_off_action:
+      - lambda: |-
+          id(g_alarm_on) = false;
+          id(g_beep_until) = 0;
+          uint8_t f[12] = {0x23, 0x0e, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0x21};
+          id(probe_uart).write_array(f, sizeof(f));
+          ESP_LOGI("m1", "alarm beep OFF");
+
 # ——— cmd 0x0F 屏幕开/关状态（SAMD20 在物理按键开关屏时发送）———
 # 开机时由 on_boot 发布 g_scr_on 恢复值作为初始状态。
 binary_sensor:
   - platform: template
     id: bs_scr_on
     name: "M1 Screen State"
+  # 采样链路：收到过 0x01 帧 = ON；连续 15s 无帧 = OFF（同时把四个传感器置 NAN）
+  - platform: template
+    id: bs_link
+    name: "M1 UART Link"
+    device_class: connectivity
+
+# ——— 主控版本（cmd 0x11 应答）———
+# 原厂 11.1.2.1；开源主控 0.9.x。仅作诊断，不按版本号推断功能兼容性。
+text_sensor:
+  - platform: template
+    id: txt_mcu_ver
+    name: "M1 MCU Version"
+    icon: "mdi:chip"
+    update_interval: never
 
 # ——— 亮度设置（cmd 0x02）——拖动即生效：set_action 里直接量化并发帧——
 # restore_value: true：重启后保留上次亮度；设置亮度即开屏，同步更新 g_scr_on。
@@ -485,6 +642,17 @@ button:
   # 重启按钮：受控重启，不经过 OTA
   - platform: restart
     name: "M1 Restart"
+  # —— 单次蜂鸣 0.5s（cmd 0x0e）——
+  # 只负责拉响，停响交给 100ms tick 到期发送，不依赖 script/delay。
+  - platform: template
+    name: "M1 Beep"
+    id: btn_beep
+    icon: "mdi:bullhorn"
+    on_press:
+      - lambda: |-
+          id(g_beep_until) = millis() + 500;
+          uint8_t f[12] = {0x23, 0x0e, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0x21};
+          id(probe_uart).write_array(f, sizeof(f));
   # —— 校时按钮（手动触发 cmd 0x03，用 NTP 当前时间）——
   - platform: template
     name: "Set RTC Time (now)"
@@ -552,14 +720,59 @@ interval:
   - interval: 1s
     then:
       - lambda: |-
-          // 1s 心跳驱动可调查询：0=关闭；否则每隔 g_query_interval_ms 发一次 0x01。
-          // SAMD20 收到 0x01 才回传感器帧（实测行为），间隔由 q_int_num 运行时调整。
-          if (id(g_query_interval_ms) == 0) return;
           uint32_t now = millis();
-          if (now - id(g_last_query_ms) >= id(g_query_interval_ms)) {
+          // ① 可调查询：0=关闭；否则每隔 g_query_interval_ms 发一次 0x01。
+          //    注意关闭查询后不会再有任何 0x01 帧，② 会把传感器如实置为失效。
+          if (id(g_query_interval_ms) != 0 &&
+              now - id(g_last_query_ms) >= id(g_query_interval_ms)) {
             id(g_last_query_ms) = now;
             uint8_t q[12] = {0x23, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x21};
             id(probe_uart).write_array(q, sizeof(q));
+          }
+          // ② 新鲜度：连续 15s 没有 0x01 帧 → 链路断开，四个传感器置 NAN。
+          //    只在翻转时发布一次，避免每秒刷屏。原厂健康位是锁存的，
+          //    "现在到底还有没有数据"只能靠这里判断。
+          if (id(g_link_ok) && now - id(g_last_frame_ms) > 15000) {
+            id(g_link_ok) = false;
+            id(bs_link).publish_state(false);
+            id(sen_hcho).publish_state(NAN);
+            id(sen_temp).publish_state(NAN);
+            id(sen_humi).publish_state(NAN);
+            id(sen_pm25).publish_state(NAN);
+            ESP_LOGW("m1", "no sample frame for 15s: sensors marked unavailable");
+          }
+          // ③ 主控版本 0x11：最多 3 次，间隔 5s，拿到即停（收到 0x17 会重置重试）
+          if (id(g_ver_tries) < 3 && (int32_t)(now - id(g_ver_next_ms)) >= 0) {
+            uint8_t v[12] = {0x23, 0x11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x21};
+            id(probe_uart).write_array(v, sizeof(v));
+            id(g_ver_tries)++;
+            id(g_ver_next_ms) = now + 5000;
+          }
+  # 蜂鸣器节拍：单次蜂鸣与告警循环都靠这里收尾（100ms 精度，够用且不受 script 影响）
+  - interval: 100ms
+    then:
+      - lambda: |-
+          uint32_t now = millis();
+          // ① 到期必发 OFF：原厂 0x0e 的「开」没有本地超时，漏发就会一直响。
+          //    这条路径不依赖任何 script/delay，只要固件还在跑就一定能停。
+          if (id(g_beep_until) != 0 && (int32_t)(now - id(g_beep_until)) >= 0) {
+            id(g_beep_until) = 0;
+            uint8_t f[12] = {0x23, 0x0e, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0x21};
+            id(probe_uart).write_array(f, sizeof(f));
+          }
+          // ② 告警循环：响 300ms / 停 1.7s，最长 60s 自动停
+          if (!id(g_alarm_on)) return;
+          if ((int32_t)(now - id(g_alarm_end)) >= 0) {
+            id(g_alarm_on) = false;
+            id(alarm_sw).publish_state(false);
+            ESP_LOGI("m1", "alarm beep timeout (60s)");
+            return;
+          }
+          if ((int32_t)(now - id(g_alarm_next)) >= 0) {
+            id(g_alarm_next) = now + 2000;
+            id(g_beep_until) = now + 300;
+            uint8_t f[12] = {0x23, 0x0e, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0x21};
+            id(probe_uart).write_array(f, sizeof(f));
           }
   # 每 6 小时补一次校时，防止 SAMD20 RTC 漂移
   - interval: 6h
